@@ -3,6 +3,11 @@ import { z } from 'zod';
 
 import { prisma } from '../db.js';
 
+/**
+ * Query for GET /v1/donors: `sort` is committed or withdrawn (default
+ * committed), `order` is asc or desc (default desc), `limit` is 1–100
+ * (default 100), and `cursor` is an optional donor UUID.
+ */
 const querySchema = z.object({
   sort: z.enum(['committed', 'withdrawn']).default('committed'),
   order: z.enum(['asc', 'desc']).default('desc'),
@@ -10,7 +15,20 @@ const querySchema = z.object({
   cursor: z.string().uuid().optional(),
 });
 
+// Stellar StrKey ed25519 public key: 'G' + 55 base32 (A-Z2-7) chars.
+/** Params for GET /v1/donors/:address; `address` must match a Stellar G... public key. */
+const addressParamSchema = z.object({
+  address: z.string().regex(/^G[A-Z2-7]{55}$/),
+});
+
 export async function donorRoutes(app: FastifyInstance): Promise<void> {
+  /**
+   * Lists donors ranked by committed or withdrawn amount.
+   * @route GET /v1/donors
+   * @query sort, order, limit, cursor
+   * @auth Public
+   * @returns 200 `{ donors: DonorWithTotals[], nextCursor: string | null }`; 400 `{ error: "invalid_request" }` for invalid query or cursor.
+   */
   app.get('/donors', async (request, reply) => {
     const parsedQuery = querySchema.safeParse(request.query);
     if (!parsedQuery.success) {
@@ -66,6 +84,60 @@ export async function donorRoutes(app: FastifyInstance): Promise<void> {
     return {
       donors,
       nextCursor: hasMore ? donors[donors.length - 1].id : null,
+    };
+  });
+
+  // Per-donor summary so the dashboard (and other clients) can show donor
+  // stats without paging through every stream and summing in the browser.
+  /**
+   * Returns one donor's aggregate giving statistics.
+   * @route GET /v1/donors/:address
+   * @param address Stellar public key
+   * @auth Public
+   * @returns 200 donor with decimal-string `totalCommitted` and `totalWithdrawn`, plus `activeStreamCount` and `distinctNgoCount`; 400 invalid address; 404 `{ error: "not_found" }`.
+   */
+  app.get('/donors/:address', async (request, reply) => {
+    const parsedParams = addressParamSchema.safeParse(request.params);
+    if (!parsedParams.success) {
+      return reply.code(400).send({ error: 'invalid_request' });
+    }
+
+    const donor = await prisma.donor.findUnique({
+      where: { address: parsedParams.data.address },
+      include: {
+        streams: {
+          select: { ngoId: true, balance: true, withdrawn: true, status: true },
+        },
+      },
+    });
+
+    if (!donor) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+
+    const { streams, ...rest } = donor;
+
+    // A cancelled stream's remaining balance is no longer committed; only what
+    // it already paid out counts, matching GET /donors.
+    const totalCommitted = streams
+      .reduce(
+        (sum, stream) =>
+          stream.status === 'CANCELLED'
+            ? sum + BigInt(stream.withdrawn)
+            : sum + BigInt(stream.balance) + BigInt(stream.withdrawn),
+        0n,
+      )
+      .toString();
+    const totalWithdrawn = streams
+      .reduce((sum, stream) => sum + BigInt(stream.withdrawn), 0n)
+      .toString();
+
+    return {
+      ...rest,
+      totalCommitted,
+      totalWithdrawn,
+      activeStreamCount: streams.filter((stream) => stream.status === 'ACTIVE').length,
+      distinctNgoCount: new Set(streams.map((stream) => stream.ngoId)).size,
     };
   });
 }
